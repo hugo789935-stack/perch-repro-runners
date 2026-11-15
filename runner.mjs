@@ -5,7 +5,7 @@
 // encrypted for the bot (AES-256-GCM, key wrapped with the bot's RSA public key in
 // bot-public.pem). The workflow logs only say which step ran, never what came out.
 //
-// Job spec: { cli?: { version, acp? }, desktop?: { seconds? } }
+// Job spec: { cli?: { version, acp? }, tui?: { version, cols, rows, steps } (Windows), desktop?: { seconds? } }
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -111,31 +111,136 @@ function npmCli() {
   return found;
 }
 
+// One global install per job (a GitHub machine is new every time), exactly like a user's `npm i -g`.
+const globalCli = { version: null, bin: null, install: null };
+async function ensureGlobalCli(version) {
+  if (globalCli.version === version && globalCli.bin) return globalCli;
+  log(`npm install -g perchai-cli@${version}`);
+  // npm through node itself: Windows won't start npm.cmd without a shell, and no shell means no quoting trouble.
+  const install = await run(process.execPath, [npmCli(), 'install', '-g', `perchai-cli@${version}`, '--no-audit', '--no-fund', '--loglevel=error'], { ms: 300000 });
+  const root = (await run(process.execPath, [npmCli(), 'root', '-g'], { ms: 30000 })).out.trim().split('\n').pop().trim();
+  const bin = path.join(root, 'perchai-cli', 'bin', 'perch');
+  Object.assign(globalCli, { version, install, bin: install.code === 0 && fs.existsSync(bin) ? bin : null, root });
+  return globalCli;
+}
+
 async function cliCheck(spec) {
   const version = String(spec.version || 'latest');
   if (!/^(latest|\d+\.\d+\.\d+(-[\w.]+)?)$/.test(version)) throw new Error('bad version');
-  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'perch-cli-'));
-  const home = freshHome();
-  const env = homeEnv(home);
-  log(`installing perchai-cli@${version}`);
-  // npm through node itself: Windows won't start npm.cmd without a shell, and no shell means no quoting trouble.
-  const install = await run(process.execPath, [npmCli(), 'install', '--prefix', prefix, `perchai-cli@${version}`, '--no-audit', '--no-fund', '--loglevel=error'], { env, cwd: prefix, ms: 300000 });
-  const bin = path.join(prefix, 'node_modules', 'perchai-cli', 'bin', 'perch');
-  const out = { node: process.version, install: { code: install.code, ms: install.ms } };
-  if (install.code !== 0 || !fs.existsSync(bin)) {
-    out.install.err = clip(String(install.out).split('\n').find(l => /ERR!|error/i.test(l)) || firstLine(install.out) || 'the perch command was not installed', 300);
+  const g = await ensureGlobalCli(version);
+  const out = { node: process.version, install: { code: g.install.code, ms: g.install.ms, global: true } };
+  if (!g.bin) {
+    out.install.code = out.install.code || 1;
+    out.install.err = clip(String(g.install.out).split('\n').find(l => /ERR!|error/i.test(l)) || firstLine(g.install.out) || 'the perch command was not installed', 300);
     return out;
   }
-  const pkg = JSON.parse(fs.readFileSync(path.join(prefix, 'node_modules', 'perchai-cli', 'package.json'), 'utf8'));
-  out.version = pkg.version;
-  const cwd = path.join(home, 'work');
+  out.version = JSON.parse(fs.readFileSync(path.join(g.root, 'perchai-cli', 'package.json'), 'utf8')).version;
+  const cwd = path.join(freshHome(), 'work');
+  const env = { ...process.env, NO_COLOR: '1', CI: '1' };
   log('perch --help / status');
-  const help = await run(process.execPath, [bin, '--help'], { env, cwd, ms: 30000 });
-  const status = await run(process.execPath, [bin, 'status'], { env, cwd, ms: 30000 });
+  const help = await run(process.execPath, [g.bin, '--help'], { env, cwd, ms: 30000 });
+  const status = await run(process.execPath, [g.bin, 'status'], { env, cwd, ms: 30000 });
   out.help = { code: help.code, killed: help.killed, crash: CRASH.test(help.out), out: clip(firstLine(help.out), 160) };
   out.status = { code: status.code, killed: status.killed, crash: CRASH.test(status.out), out: clip(firstLine(status.out), 160) };
-  if (spec.acp) { log('ACP handshake'); out.acp = await acpHandshake(bin, env, cwd); }
+  if (IS_WIN) {
+    // How Windows users actually start it: the npm shims from cmd and PowerShell, and PowerShell
+    // under Windows 11's default script policy, which blocks npm's unsigned perch.ps1.
+    log('perch from cmd and PowerShell');
+    const shell = async (cmd, args) => {
+      const r = await run(cmd, args, { env, cwd, ms: 45000 });
+      return { code: r.code, out: clip(firstLine(r.out), 160), blocked: /running scripts is disabled|cannot be loaded because|not digitally signed/i.test(r.out), notFound: /is not recognized|CommandNotFound/i.test(r.out) };
+    };
+    const where = await run('where.exe', ['perch'], { env, cwd, ms: 15000 });
+    out.shells = {
+      onPath: where.code === 0,
+      cmd: await shell('cmd.exe', ['/d', '/c', 'perch --help']),
+      powershell: await shell('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-Command', 'perch --help']),
+      powershellDefault: await shell('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Restricted', '-Command', 'perch --help'])
+    };
+  }
+  if (spec.acp) { log('ACP handshake'); out.acp = await acpHandshake(g.bin, env, cwd); }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Perch CLI interactive screen in a real Windows console (conhost)
+// ---------------------------------------------------------------------------
+
+// The bot's key names (tmux style) as SendKeys codes.
+const SENDKEYS = { Enter: '{ENTER}', Tab: '{TAB}', BTab: '+{TAB}', Escape: '{ESC}', Up: '{UP}', Down: '{DOWN}', Left: '{LEFT}', Right: '{RIGHT}', BSpace: '{BACKSPACE}', DC: '{DELETE}', Home: '{HOME}', End: '{END}', PageUp: '{PGUP}', PageDown: '{PGDN}', Space: ' ', 'M-Enter': '%{ENTER}' };
+for (const c of 'cdlraekuwotpnj') SENDKEYS[`C-${c}`] = `^${c}`;
+const sendKeysText = (t) => String(t).replace(/[+^%~(){}[\]]/g, (m) => `{${m}}`);
+const psq = (t) => String(t).replace(/'/g, "''");
+
+const WIN_API = `
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public struct RECT { public int Left, Top, Right, Bottom; }
+public static class W {
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool r);
+}
+"@
+function Get-Win([int]$id) { $p = Get-Process -Id $id -ErrorAction SilentlyContinue; if ($p -and $p.MainWindowHandle -ne 0) { return $p.MainWindowHandle }
+  $q = Get-Process | Where-Object { $_.MainWindowTitle -match 'perch' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1; if ($q) { return $q.MainWindowHandle }; return [IntPtr]::Zero }
+function Front($h) { [W]::ShowWindow($h, 9) | Out-Null; [W]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 300 }
+`;
+
+async function tuiWindows(spec, outDir) {
+  const version = String(spec.version || 'latest');
+  if (!/^(latest|\d+\.\d+\.\d+(-[\w.]+)?)$/.test(version)) throw new Error('bad version');
+  const g = await ensureGlobalCli(version);
+  if (!g.bin) return { ok: false, error: 'perchai-cli did not install' };
+  const cols = Math.min(110, Math.max(40, Number(spec.cols) || 100));
+  const rows = Math.min(40, Math.max(12, Number(spec.rows) || 32));
+  const work = path.join(freshHome(), 'work');
+  // A classic console window (conhost) running perch at the asked size, in an empty folder.
+  const launch = await PS(`$p = Start-Process conhost.exe -ArgumentList 'cmd.exe /k title perch-tui & mode con: cols=${cols} lines=${rows} & cd /d "${psq(work)}" & perch' -PassThru; $p.Id`, 30000);
+  const pid = Number((launch.out.match(/\d+/) || [])[0]);
+  if (!pid) return { ok: false, error: 'the console window did not open' };
+  await sleep(Math.min(20000, Math.max(4000, Number(spec.startMs) || 8000)));
+  const frames = [];
+  let shotN = 0, curCols = cols, curRows = rows;
+  const capture = async (label) => {
+    if (shotN >= 8) return;
+    const file = path.join(outDir, `tui-${++shotN}.png`);
+    await PS(`${WIN_API}
+$h = Get-Win ${pid}; $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; $x=$b.Left; $y=$b.Top; $w=$b.Width; $hh=$b.Height
+if ($h -ne [IntPtr]::Zero) { Front $h; $r = New-Object RECT; if ([W]::GetWindowRect($h, [ref]$r)) { $x=$r.Left; $y=$r.Top; $w=$r.Right-$r.Left; $hh=$r.Bottom-$r.Top } }
+$i = New-Object System.Drawing.Bitmap $w, $hh; $gr = [System.Drawing.Graphics]::FromImage($i); $gr.CopyFromScreen($x, $y, 0, 0, $i.Size); $i.Save('${psq(file)}', [System.Drawing.Imaging.ImageFormat]::Png)`, 45000);
+    frames.push({ label: clip(label, 80), shot: fs.existsSync(file) ? path.basename(file) : null });
+  };
+  try {
+    await capture('start');
+    for (const st of (spec.steps || []).slice(0, 12)) {
+      const v = String(st.value ?? '');
+      let label = '', keys = null;
+      if (st.type === 'text' && v) { keys = sendKeysText(v.slice(0, 200)); label = `typed "${v.slice(0, 60)}"`; }
+      else if (st.type === 'key' && SENDKEYS[v]) { const n = Math.min(10, Math.max(1, Number(st.repeat) || 1)); keys = SENDKEYS[v].repeat(n); label = n > 1 ? `${v} x${n}` : v; }
+      else if (st.type === 'resize' && /^\d{2,3}x\d{2}$/.test(v)) {
+        const [c, r] = v.split('x').map(Number);
+        // Same cell size as now, new number of columns and rows; Windows reflows the console like a user dragging its edge.
+        await PS(`${WIN_API}
+$h = Get-Win ${pid}; if ($h -ne [IntPtr]::Zero) { $c = New-Object RECT; $wr = New-Object RECT; [W]::GetClientRect($h, [ref]$c) | Out-Null; [W]::GetWindowRect($h, [ref]$wr) | Out-Null
+$cw = ($c.Right - $c.Left) / ${curCols}; $ch = ($c.Bottom - $c.Top) / ${curRows}; $bw = ($wr.Right - $wr.Left) - ($c.Right - $c.Left); $bh = ($wr.Bottom - $wr.Top) - ($c.Bottom - $c.Top)
+[W]::MoveWindow($h, 0, 0, [int]($bw + $cw * ${c}), [int]($bh + $ch * ${r}), $true) | Out-Null }`, 30000);
+        curCols = c; curRows = r;
+        label = `resized to ${c}x${r}`;
+      } else if (st.type === 'wait') { await sleep(Math.min(15000, Math.max(200, Number(v) || 500))); continue; }
+      else continue;
+      if (keys != null) await PS(`${WIN_API}
+$h = Get-Win ${pid}; if ($h -ne [IntPtr]::Zero) { Front $h }; [System.Windows.Forms.SendKeys]::SendWait('${psq(keys)}')`, 30000);
+      await sleep(Math.min(8000, Math.max(400, Number(st.settleMs) || 1200)));
+      await capture(label);
+    }
+    return { ok: true, version: g.version === 'latest' ? null : g.version, size: `${cols}x${rows}`, console: 'conhost', frames };
+  } finally {
+    await PS(`Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'perchai-cli' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +391,9 @@ async function main() {
   if (IS_WIN) result.osName = clip((await PS('(Get-CimInstance Win32_OperatingSystem).Caption')).out, 60);
   if (IS_MAC) result.osName = `macOS ${clip(spawnSync('sw_vers', ['-productVersion']).stdout?.toString(), 20)}`;
   try { if (job.cli) result.cli = await cliCheck(job.cli); } catch (e) { result.cli = { error: clip(e.message, 200) }; }
+  try { if (job.tui && IS_WIN) result.tui = await tuiWindows(job.tui, shotsDir); } catch (e) { result.tui = { ok: false, error: clip(e.message, 200) }; }
   try { if (job.desktop) result.desktop = await desktopCheck(job.desktop, shotsDir); } catch (e) { result.desktop = { error: clip(e.message, 200) }; }
-  const files = fs.readdirSync(shotsDir).filter(n => /^[a-z0-9-]+\.png$/.test(n)).slice(0, 4)
+  const files = fs.readdirSync(shotsDir).filter(n => /^[a-z0-9-]+\.png$/.test(n)).sort().slice(0, 10)
     .map(name => ({ name, b64: fs.readFileSync(path.join(shotsDir, name)).toString('base64') }));
   const pem = fs.readFileSync(path.join(HERE, 'bot-public.pem'), 'utf8');
   fs.writeFileSync(path.join(outDir, 'result.bin'), sealFor(pem, { id, result, files }));
