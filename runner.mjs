@@ -211,7 +211,19 @@ async function tuiWindows(spec, outDir) {
     await PS(`${WIN_API}
 $h = Get-Win ${pid}; $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; $x=$b.Left; $y=$b.Top; $w=$b.Width; $hh=$b.Height
 if ($h -ne [IntPtr]::Zero) { Front $h; $r = New-Object RECT; if ([W]::GetWindowRect($h, [ref]$r)) { $x=$r.Left; $y=$r.Top; $w=$r.Right-$r.Left; $hh=$r.Bottom-$r.Top } }
-$i = New-Object System.Drawing.Bitmap $w, $hh; $gr = [System.Drawing.Graphics]::FromImage($i); $gr.CopyFromScreen($x, $y, 0, 0, $i.Size); $i.Save('${psq(file)}', [System.Drawing.Imaging.ImageFormat]::Png)`, 45000);
+# The CLI redraws its screen often (animations), so a capture can land mid-repaint and come out
+# black: take up to 5 and keep the first with text on it (or the brightest).
+$best = $null; $bestScore = -1
+for ($k = 0; $k -lt 5; $k++) {
+  $i = New-Object System.Drawing.Bitmap $w, $hh; $gr = [System.Drawing.Graphics]::FromImage($i); $gr.CopyFromScreen($x, $y, 0, 0, $i.Size); $gr.Dispose()
+  $lit = 0; $tot = 0
+  for ($py = 40; $py -lt $hh; $py += 12) { for ($px = 4; $px -lt $w; $px += 12) { $c = $i.GetPixel($px, $py); $tot++; if (($c.R + $c.G + $c.B) -gt 90) { $lit++ } } }
+  $score = $lit / [Math]::Max(1, $tot)
+  if ($score -gt $bestScore) { if ($best) { $best.Dispose() }; $best = $i; $bestScore = $score } else { $i.Dispose() }
+  if ($score -gt 0.01) { break }
+  Start-Sleep -Milliseconds 450
+}
+$best.Save('${psq(file)}', [System.Drawing.Imaging.ImageFormat]::Png)`, 60000);
     frames.push({ label: clip(label, 80), shot: fs.existsSync(file) ? path.basename(file) : null });
   };
   try {
