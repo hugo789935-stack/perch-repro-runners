@@ -1,0 +1,50 @@
+# Started by PerchBot through the GitHub API (workflow_dispatch) for one bug report at a time.
+# The job spec carries versions and switches only, never the text of anyone's post, and the
+# results are encrypted for the bot before they are uploaded, so nothing readable is published.
+name: repro
+run-name: repro ${{ inputs.id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: Job id from PerchBot
+        required: true
+        type: string
+      os:
+        description: windows or macos
+        required: true
+        type: choice
+        options: [windows, macos]
+      job:
+        description: Job spec (JSON)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ${{ inputs.os == 'macos' && 'macos-latest' || 'windows-latest' }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the checks
+        # Inputs go in through the environment, never pasted into the script.
+        env:
+          JOB: ${{ inputs.job }}
+          JOB_ID: ${{ inputs.id }}
+          JOB_OS: ${{ inputs.os }}
+        run: node runner.mjs
+      - name: Upload the encrypted result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ inputs.id }}
+          path: out/result.bin
+          retention-days: 1
+          if-no-files-found: error
