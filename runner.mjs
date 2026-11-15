@@ -259,7 +259,10 @@ async function tuiWindows(spec, outDir) {
     await sleep(1000);
     const found = await PS(`${WIN_API}
 $c = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '${marker}' } | Select-Object -First 1
-"IDS:$($c.ProcessId):$([W]::Find('${marker}'))"`, 30000);
+$w = [W]::Find('${marker}')
+# conhost: the window belongs to the cmd process, and cmd retitles it while perch runs.
+if (-not $w -and $c) { $q = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue; if ($q) { $w = [int64]$q.MainWindowHandle } }
+"IDS:$($c.ProcessId):$w"`, 30000);
     const m = found.out.match(/IDS:(\d*):(\d*)/);
     if (m) { cmdPid = Number(m[1]) || cmdPid; hwnd = Number(m[2]) || hwnd; }
   }
