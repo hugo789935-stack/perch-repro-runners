@@ -162,7 +162,24 @@ function findFile(dir, name, depth = 4) {
 }
 
 const PS = (script, ms = 30000) => run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { ms });
-const SHOT_PS = (file) => `Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; $i=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($i); $g.CopyFromScreen($b.Left,$b.Top,0,0,$i.Size); $i.Save('${file.replace(/'/g, "''")}',[System.Drawing.Imaging.ImageFormat]::Png)`;
+// Brings the app's main window to the front and captures just that window (the whole screen if
+// there is none): the runner's own console sits on top of the desktop otherwise.
+const SHOT_PS = (file) => `
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public struct RECT { public int Left, Top, Right, Bottom; }
+public static class W { [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n); }
+"@
+$p = Get-Process | Where-Object { $_.ProcessName -match 'Perch' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+$b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$x = $b.Left; $y = $b.Top; $w = $b.Width; $h = $b.Height
+if ($p) { [W]::ShowWindow($p.MainWindowHandle, 9) | Out-Null; [W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 700
+  $r = New-Object RECT; if ([W]::GetWindowRect($p.MainWindowHandle, [ref]$r) -and ($r.Right - $r.Left) -gt 200) { $x = $r.Left; $y = $r.Top; $w = $r.Right - $r.Left; $h = $r.Bottom - $r.Top } }
+$i = New-Object System.Drawing.Bitmap $w, $h; $g = [System.Drawing.Graphics]::FromImage($i); $g.CopyFromScreen($x, $y, 0, 0, $i.Size)
+$i.Save('${file.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png)`;
 
 async function screenshot(file) {
   if (IS_WIN) await PS(SHOT_PS(file));
@@ -199,7 +216,7 @@ async function desktopCheck(spec, outDir) {
       await PS("Get-Process | Where-Object { $_.ProcessName -match 'Perch' } | Stop-Process -Force -ErrorAction SilentlyContinue");
       const roots = [path.join(process.env.LOCALAPPDATA || '', 'Programs'), process.env.ProgramFiles || 'C:\\Program Files'];
       for (const r of roots) { exe = findFile(r, 'Perch Terminal.exe', 2) || findFile(r, 'perch-terminal.exe', 2); if (exe) break; }
-      if (exe) res.version = clip((await PS(`(Get-Item '${exe.replace(/'/g, "''")}').VersionInfo.ProductVersion`)).out, 30);
+      if (exe) res.version = clip((await PS(`(Get-Item '${exe.replace(/'/g, "''")}').VersionInfo.ProductVersion`)).out, 30).replace(/^(\d+\.\d+\.\d+)\.0$/, '$1');
     } else {
       mount = path.join(work, 'mnt');
       fs.mkdirSync(mount);
@@ -218,7 +235,9 @@ async function desktopCheck(spec, outDir) {
     const home = freshHome();
     let exited = null;
     let logText = '';
-    child = spawn(exe, [], { env: { ...homeEnv(home), ELECTRON_ENABLE_LOGGING: '1' }, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Each GitHub machine is brand new, so the normal profile is already a first launch. (Pointing
+    // APPDATA at an empty folder makes Electron fail with "Failed to get 'appData' path" on Windows.)
+    child = spawn(exe, [], { env: { ...(IS_WIN ? process.env : homeEnv(home)), ELECTRON_ENABLE_LOGGING: '1' }, cwd: home, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', d => { if (logText.length < 200000) logText += d; });
     child.stderr.on('data', d => { if (logText.length < 200000) logText += d; });
     child.on('exit', (code, signal) => { exited = { code, signal }; });
@@ -229,7 +248,10 @@ async function desktopCheck(spec, outDir) {
     const s2 = await screenshot(path.join(outDir, 'desktop-2.png'));
     res.alive = !exited;
     res.exit = exited ? exited.code : null;
-    res.shots = [s1, s2].filter(Boolean);
+    // Nothing changed between the two captures: keep only the later one.
+    const p1 = path.join(outDir, 'desktop-1.png'), p2 = path.join(outDir, 'desktop-2.png');
+    if (s1 && s2 && fs.readFileSync(p1).equals(fs.readFileSync(p2))) fs.rmSync(p1);
+    res.shots = [s1, s2].filter(n => n && fs.existsSync(path.join(outDir, n)));
     res.errors = [...new Set(logText.split('\n').map(l => l.trim()).filter(l => /\b(error|fatal|uncaught|exception|crash|cannot|failed)\b/i.test(l) && !/dbus|gpu|viz|GLES|Electron Security Warning|DevTools/i.test(l)).map(l => clip(l.replace(/^\[[^\]]*\]\s*/, ''), 200)))].slice(0, 5);
     return res;
   } finally {
