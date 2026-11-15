@@ -214,13 +214,12 @@ public static class CON {
   }
 }`;
 
-async function readConsole(conhostPid) {
-  const file = path.join(os.tmpdir(), `con-${conhostPid}-${Date.now()}.txt`);
+async function readConsole(cmdPid) {
+  const file = path.join(os.tmpdir(), `con-${cmdPid}-${Date.now()}.txt`);
   await PS(`Add-Type -TypeDefinition @"
 ${READ_CONSOLE_CS}
 "@
-$c = Get-CimInstance Win32_Process -Filter "ParentProcessId=${conhostPid}" | Where-Object { $_.Name -eq 'cmd.exe' } | Select-Object -First 1
-if ($c) { [CON]::Dump([uint32]$c.ProcessId, '${psq(file)}') } else { Set-Content -Path '${psq(file)}' -Value 'NO CONSOLE PROCESS' }`, 45000);
+[CON]::Dump([uint32]${Number(cmdPid)}, '${psq(file)}')`, 45000);
   let text = '';
   try { text = fs.readFileSync(file, 'utf8'); fs.rmSync(file, { force: true }); } catch (e) { /* none */ }
   return text.split('\n').map(l => l.replace(/\s+$/, '')).join('\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, 5000);
@@ -234,10 +233,27 @@ async function tuiWindows(spec, outDir) {
   const cols = Math.min(110, Math.max(40, Number(spec.cols) || 100));
   const rows = Math.min(40, Math.max(12, Number(spec.rows) || 32));
   const work = path.join(freshHome(), 'work');
-  // A classic console window (conhost) running perch at the asked size, in an empty folder.
-  const launch = await PS(`$p = Start-Process conhost.exe -ArgumentList 'cmd.exe /k title perch-tui & mode con: cols=${cols} lines=${rows} & cd /d "${psq(work)}" & perch' -PassThru; $p.Id`, 30000);
-  const pid = Number((launch.out.match(/\d+/) || [])[0]);
-  if (!pid) return { ok: false, error: 'the console window did not open' };
+  const marker = `perch-tui-${crypto.randomBytes(3).toString('hex')}`;
+  // Windows Terminal (Windows 11's default) when it's there, else the classic console (conhost,
+  // Windows 10's default); perch runs in an empty folder at the asked size.
+  const hasWt = (await PS('if (Get-Command wt.exe -ErrorAction SilentlyContinue) { "yes" }')).out.includes('yes');
+  const terminal = spec.terminal === 'conhost' || !hasWt ? 'conhost' : 'wt';
+  const inner = `title ${marker} & cd /d ${work} & perch`; // the temp path has no spaces
+  await PS(terminal === 'wt'
+    ? `Start-Process wt.exe -ArgumentList '-w new --size ${cols},${rows} --title ${marker} --suppressApplicationTitle cmd.exe /k "${psq(inner)}"'`
+    : `Start-Process conhost.exe -ArgumentList 'cmd.exe /k mode con: cols=${cols} lines=${rows} & ${psq(inner)}'`, 30000);
+  // The cmd.exe that runs perch (to read its console) and the window showing it (for keys and pictures).
+  let cmdPid = 0, hwnd = 0;
+  for (let i = 0; i < 20 && !(cmdPid && hwnd); i++) {
+    await sleep(1000);
+    const found = await PS(`$c = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" | Where-Object { $_.CommandLine -match '${marker}' } | Select-Object -First 1
+$w = Get-Process | Where-Object { $_.MainWindowTitle -match '${marker}' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+if (-not $w) { $w = Get-Process ${terminal === 'wt' ? 'WindowsTerminal' : 'conhost'} -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object StartTime -Descending | Select-Object -First 1 }
+"$($c.ProcessId) $([int64]$w.MainWindowHandle)"`, 30000);
+    const [a, b] = found.out.trim().split(/\s+/).map(Number);
+    cmdPid = a || cmdPid; hwnd = b || hwnd;
+  }
+  if (!cmdPid || !hwnd) return { ok: false, error: `the ${terminal === 'wt' ? 'Windows Terminal' : 'console'} window did not open` };
   await sleep(Math.min(20000, Math.max(4000, Number(spec.startMs) || 8000)));
   const frames = [];
   let shotN = 0, curCols = cols, curRows = rows;
@@ -245,7 +261,7 @@ async function tuiWindows(spec, outDir) {
     if (shotN >= 8) return;
     const file = path.join(outDir, `tui-${++shotN}.png`);
     await PS(`${WIN_API}
-$h = Get-Win ${pid}; $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; $x=$b.Left; $y=$b.Top; $w=$b.Width; $hh=$b.Height
+$h = [IntPtr]${hwnd}; $b = [System.Windows.Forms.SystemInformation]::VirtualScreen; $x=$b.Left; $y=$b.Top; $w=$b.Width; $hh=$b.Height
 if ($h -ne [IntPtr]::Zero) { Front $h; $r = New-Object RECT; if ([W]::GetWindowRect($h, [ref]$r)) { $x=$r.Left; $y=$r.Top; $w=$r.Right-$r.Left; $hh=$r.Bottom-$r.Top } }
 # The CLI redraws its screen often (animations), so a capture can land mid-repaint and come out
 # black: take up to 5 and keep the first with text on it (or the brightest).
@@ -260,7 +276,7 @@ for ($k = 0; $k -lt 5; $k++) {
   Start-Sleep -Milliseconds 450
 }
 $best.Save('${psq(file)}', [System.Drawing.Imaging.ImageFormat]::Png)`, 60000);
-    frames.push({ label: clip(label, 80), shot: fs.existsSync(file) ? path.basename(file) : null, screen: await readConsole(pid) });
+    frames.push({ label: clip(label, 80), shot: fs.existsSync(file) ? path.basename(file) : null, screen: await readConsole(cmdPid) });
   };
   try {
     await capture('start');
@@ -273,7 +289,7 @@ $best.Save('${psq(file)}', [System.Drawing.Imaging.ImageFormat]::Png)`, 60000);
         const [c, r] = v.split('x').map(Number);
         // Same cell size as now, new number of columns and rows; Windows reflows the console like a user dragging its edge.
         await PS(`${WIN_API}
-$h = Get-Win ${pid}; if ($h -ne [IntPtr]::Zero) { $c = New-Object RECT; $wr = New-Object RECT; [W]::GetClientRect($h, [ref]$c) | Out-Null; [W]::GetWindowRect($h, [ref]$wr) | Out-Null
+$h = [IntPtr]${hwnd}; if ($h -ne [IntPtr]::Zero) { $c = New-Object RECT; $wr = New-Object RECT; [W]::GetClientRect($h, [ref]$c) | Out-Null; [W]::GetWindowRect($h, [ref]$wr) | Out-Null
 $cw = ($c.Right - $c.Left) / ${curCols}; $ch = ($c.Bottom - $c.Top) / ${curRows}; $bw = ($wr.Right - $wr.Left) - ($c.Right - $c.Left); $bh = ($wr.Bottom - $wr.Top) - ($c.Bottom - $c.Top)
 [W]::MoveWindow($h, 0, 0, [int]($bw + $cw * ${c}), [int]($bh + $ch * ${r}), $true) | Out-Null }`, 30000);
         curCols = c; curRows = r;
@@ -281,13 +297,13 @@ $cw = ($c.Right - $c.Left) / ${curCols}; $ch = ($c.Bottom - $c.Top) / ${curRows}
       } else if (st.type === 'wait') { await sleep(Math.min(15000, Math.max(200, Number(v) || 500))); continue; }
       else continue;
       if (keys != null) await PS(`${WIN_API}
-$h = Get-Win ${pid}; if ($h -ne [IntPtr]::Zero) { Front $h }; [System.Windows.Forms.SendKeys]::SendWait('${psq(keys)}')`, 30000);
+$h = [IntPtr]${hwnd}; if ($h -ne [IntPtr]::Zero) { Front $h }; [System.Windows.Forms.SendKeys]::SendWait('${psq(keys)}')`, 30000);
       await sleep(Math.min(8000, Math.max(400, Number(st.settleMs) || 1800)));
       await capture(label);
     }
-    return { ok: true, version: g.version === 'latest' ? null : g.version, size: `${cols}x${rows}`, console: 'conhost', frames };
+    return { ok: true, version: g.version === 'latest' ? null : g.version, size: `${cols}x${rows}`, console: terminal === 'wt' ? 'Windows Terminal' : 'conhost', frames };
   } finally {
-    await PS(`Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'perchai-cli' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`);
+    await PS(`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'perchai-cli' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Stop-Process -Id ${cmdPid} -Force -ErrorAction SilentlyContinue; Get-Process ${terminal === 'wt' ? 'WindowsTerminal' : 'conhost'} -ErrorAction SilentlyContinue | Where-Object { [int64]$_.MainWindowHandle -eq ${hwnd} } | Stop-Process -Force -ErrorAction SilentlyContinue`);
   }
 }
 
