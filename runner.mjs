@@ -53,6 +53,25 @@ function freshHome() {
   return home;
 }
 
+/** Perch Terminal's own log (<app data>/Perch AI Desktop/desktop-runtime.log): crashes, load failures, console errors. */
+function readRuntimeLog(files) {
+  const file = files.find(f => f && fs.existsSync(f));
+  if (!file) return null;
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8').slice(-400000); } catch (e) { return null; }
+  const events = text.split('\n').map(l => { try { return JSON.parse(l); } catch (e) { return null; } }).filter(e => e && typeof e.kind === 'string');
+  const counts = {};
+  for (const e of events) counts[e.kind] = (counts[e.kind] || 0) + 1;
+  const notable = [];
+  for (const e of events) {
+    if (e.kind === 'render-process-gone') notable.push(`the app's window process died: ${e.reason} (exit ${e.exitCode})`);
+    else if (e.kind === 'did-fail-load') notable.push(`the app's page failed to load: ${e.errorDescription || '?'} (${e.errorCode})${e.retried ? ', after a retry' : ''}`);
+    else if (e.kind === 'perch-mcp-server-start-failed') notable.push(`Perch's MCP server failed to start: ${e.error}`);
+    else if (e.kind === 'renderer-console' && Number(e.level) >= 3) notable.push(`console error: ${e.message}`);
+  }
+  return { counts, notable: [...new Set(notable.map(n => clip(n, 220)))].slice(0, 6) };
+}
+
 const homeEnv = (home) => ({ ...process.env, HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(home, 'AppData', 'Local'), NO_COLOR: '1', CI: '1' });
 
 // ---------------------------------------------------------------------------
@@ -441,6 +460,10 @@ async function desktopCheck(spec, outDir) {
     if (s1 && s2 && fs.readFileSync(p1).equals(fs.readFileSync(p2))) fs.rmSync(p1);
     res.shots = [s1, s2].filter(n => n && fs.existsSync(path.join(outDir, n)));
     res.errors = [...new Set(logText.split('\n').map(l => l.trim()).filter(l => /\b(error|fatal|uncaught|exception|crash|cannot|failed)\b/i.test(l) && !/dbus|gpu|viz|GLES|Electron Security Warning|DevTools/i.test(l)).map(l => clip(l.replace(/^\[[^\]]*\]\s*/, ''), 200)))].slice(0, 5);
+    const rel = ['Perch AI Desktop', 'desktop-runtime.log'];
+    res.runtime = readRuntimeLog(IS_WIN
+      ? [path.join(process.env.APPDATA || '', ...rel)]
+      : [path.join(home, 'Library', 'Application Support', ...rel), path.join(os.homedir(), 'Library', 'Application Support', ...rel)]);
     return res;
   } finally {
     if (child && child.exitCode == null) { try { child.kill('SIGKILL'); } catch (e) { /* gone */ } }
