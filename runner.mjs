@@ -404,13 +404,11 @@ async function windowTitles(match) {
   return r.code === 0 ? r.out.split(',').map(s => s.trim()).filter(Boolean).slice(0, 4) : null;
 }
 
-async function desktopCheck(spec, outDir) {
-  const seconds = Math.min(60, Math.max(12, Number(spec.seconds) || 25));
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'perch-desk-'));
-  const plat = IS_WIN ? 'windows' : (process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64');
-  const res = { platform: plat, seconds };
-  let exe = null, child = null, mount = null;
-  try {
+/** Download and install Perch Terminal; { exe, mount } with res.version / res.size / res.install filled in. */
+async function installApp(work, res) {
+  const plat = res.platform;
+  let exe = null, mount = null;
+  {
     log(`downloading the ${plat} build`);
     const file = path.join(work, IS_WIN ? 'setup.exe' : 'app.dmg');
     res.size = await download(DOWNLOADS[plat], file);
@@ -437,6 +435,18 @@ async function desktopCheck(spec, outDir) {
         res.version = key('CFBundleShortVersionString') || '';
       }
     }
+  }
+  return { exe, mount };
+}
+
+async function desktopCheck(spec, outDir) {
+  const seconds = Math.min(60, Math.max(12, Number(spec.seconds) || 25));
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'perch-desk-'));
+  const plat = IS_WIN ? 'windows' : (process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64');
+  const res = { platform: plat, seconds };
+  let exe = null, child = null, mount = null;
+  try {
+    ({ exe, mount } = await installApp(work, res));
     if (!exe || !fs.existsSync(exe)) { res.error = 'the app was not installed'; return res; }
     log('launching the app');
     const home = freshHome();
@@ -473,6 +483,178 @@ async function desktopCheck(spec, outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// App agent session: the bot's AI drives Perch Terminal here, one action at a time
+// ---------------------------------------------------------------------------
+// Neither side can reach the other directly, so messages go through a throwaway branch of this
+// repo (s-<job id>, made and deleted by the bot). Everything on it is encrypted: this runner makes a
+// session key that only the bot can unwrap (RSA-OAEP), and every command and screen after that is
+// AES-256-GCM with that key, so commands that don't come from the bot are rejected.
+
+const APP_BLOCKED = /billing|checkout|payment|stripe|paypal|alipay|subscribe|upgrade|pricing|\bpass=|delete.?account|logout|sign.?out/i;
+const SNAPSHOT_JS = `(() => {
+  const vis = (el) => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el); return r.width > 2 && r.height > 2 && st.visibility !== 'hidden' && st.display !== 'none' && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth; };
+  const sel = 'button, a[href], input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=menuitem], [role=option], [role=tab], [role=checkbox], [role=switch], [role=combobox], [role=textbox], [contenteditable=true], [contenteditable=""]';
+  const els = [...document.querySelectorAll(sel)].filter(vis).slice(0, 80);
+  window.__perchEls = els;
+  const clean = (t, n) => String(t || '').replace(/\\s+/g, ' ').trim().slice(0, n);
+  const isField = (el) => el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || /^(textbox|combobox)$/.test(el.getAttribute('role') || '');
+  const label = (el) => clean(isField(el) ? (el.getAttribute('aria-label') || el.placeholder || el.getAttribute('data-placeholder') || el.title || el.name) : (el.getAttribute('aria-label') || el.innerText || el.value || el.title || el.getAttribute('alt') || el.name), 70);
+  const value = (el) => (el.tagName === 'SELECT' ? (el.selectedOptions[0] || {}).text : el.isContentEditable ? el.innerText : el.value);
+  const elements = els.map((el, i) => {
+    const role = el.getAttribute('role') || (el.isContentEditable ? 'textbox' : el.tagName.toLowerCase()) + (el.type && el.tagName !== 'BUTTON' ? ':' + el.type : '');
+    const state = [el.disabled || el.getAttribute('aria-disabled') === 'true' ? 'disabled' : '', el.checked || el.getAttribute('aria-checked') === 'true' ? 'checked' : '', el.getAttribute('aria-expanded') === 'true' ? 'expanded' : '', el.getAttribute('aria-selected') === 'true' ? 'selected' : '', document.activeElement === el ? 'focused' : ''].filter(Boolean).join(',');
+    const v = isField(el) && el.type !== 'password' ? clean(value(el), 160) : '';
+    return (i + 1) + '. ' + role + ': ' + (label(el) || '(no label)') + (state ? ' [' + state + ']' : '') + (isField(el) ? (v ? ' = "' + v + '"' : ' = (empty)') : '');
+  });
+  const overlay = [...document.querySelectorAll('[role=dialog], [role=alertdialog], [role=menu], [role=listbox], [aria-modal=true]')].filter(vis).map(e => e.innerText.replace(/\\s+/g, ' ').trim()).join(' | ').slice(0, 800);
+  return JSON.stringify({ title: document.title, url: location.href, overlay, text: (document.body ? document.body.innerText : '').replace(/[ \\t]+/g, ' ').replace(/\\n{2,}/g, '\\n').trim().slice(0, 3000), elements });
+})()`;
+const VK = { Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46, Space: 32, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, PageUp: 33, PageDown: 34, Home: 36, End: 35 };
+
+function cdpConnect(url) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url);
+    let seq = 0;
+    const pending = new Map();
+    const listeners = [];
+    ws.onopen = () => resolve({
+      send: (method, params = {}) => new Promise((res, rej) => { const id = ++seq; pending.set(id, { res, rej }); ws.send(JSON.stringify({ id, method, params })); }),
+      on: (fn) => listeners.push(fn),
+      close: () => { try { ws.close(); } catch (e) { /* closed */ } }
+    });
+    ws.onerror = () => reject(new Error('DevTools connection failed'));
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.id && pending.has(msg.id)) { const p = pending.get(msg.id); pending.delete(msg.id); if (msg.error) p.rej(new Error(msg.error.message)); else p.res(msg.result); } else if (msg.method) for (const fn of listeners) fn(msg);
+    };
+  });
+}
+
+async function pressKey(cdp, combo) {
+  const parts = String(combo).split('+').map(x => x.trim()).filter(Boolean);
+  const name = parts.pop();
+  const mods = { Alt: 1, Control: 2, Ctrl: 2, Meta: 4, Cmd: 4, Shift: 8 };
+  const modifiers = parts.reduce((m, p) => m | (mods[p] || 0), 0);
+  const single = name.length === 1;
+  const vk = VK[name] || (single ? name.toUpperCase().charCodeAt(0) : 0);
+  if (!vk) throw new Error(`unknown key ${name}`);
+  const key = name === 'Space' ? ' ' : name;
+  const code = single ? (/[a-z]/i.test(name) ? `Key${name.toUpperCase()}` : `Digit${name}`) : name;
+  const text = single && !modifiers ? name : name === 'Enter' ? '\r' : name === 'Space' ? ' ' : undefined;
+  await cdp.send('Input.dispatchKeyEvent', { type: text ? 'keyDown' : 'rawKeyDown', key, code, windowsVirtualKeyCode: vk, modifiers, ...(text ? { text } : {}) });
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: vk, modifiers });
+}
+async function clickAt(cdp, x, y) {
+  for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+}
+async function elementCenter(cdp, n) {
+  const r = await cdp.send('Runtime.evaluate', { returnByValue: true, expression: `(() => { const el = (window.__perchEls || [])[${Number(n) - 1}]; if (!el) return null; el.scrollIntoView({ block: 'center', inline: 'center' }); const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()` });
+  return r?.result?.value || null;
+}
+
+export const boxed = (key, obj) => {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const data = Buffer.concat([c.update(zlib.gzipSync(Buffer.from(JSON.stringify(obj)))), c.final()]);
+  return { iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), data: data.toString('base64') };
+};
+export const unboxed = (key, b) => {
+  const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(b.iv, 'base64'));
+  d.setAuthTag(Buffer.from(b.tag, 'base64'));
+  return JSON.parse(zlib.gunzipSync(Buffer.concat([d.update(Buffer.from(b.data, 'base64')), d.final()])).toString('utf8'));
+};
+
+const ghHead = (raw) => ({ authorization: `Bearer ${process.env.GH_TOKEN}`, accept: raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'perch-repro-runner', 'cache-control': 'no-cache' });
+async function mailPut(branch, name, obj) {
+  const r = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/${name}`, { method: 'PUT', headers: { ...ghHead(false), 'content-type': 'application/json' }, body: JSON.stringify({ message: `session ${name}`, branch, content: Buffer.from(JSON.stringify(obj)).toString('base64') }), signal: AbortSignal.timeout(60000) });
+  if (!r.ok) throw new Error(`mailbox write ${r.status}`);
+}
+async function mailGet(branch, name) {
+  const r = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/${name}?ref=${branch}&t=${Date.now()}`, { headers: ghHead(true), signal: AbortSignal.timeout(30000) }).catch(() => null);
+  if (!r || r.status === 404 || !r.ok) return null;
+  try { return JSON.parse(await r.text()); } catch (e) { return null; }
+}
+
+async function appSession(spec, id) {
+  const branch = `s-${id}`;
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'perch-agent-'));
+  const res = { platform: IS_WIN ? 'windows' : (process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64') };
+  let child = null, cdp = null, mount = null, exe = null;
+  const errors = [], failed = [];
+  try {
+    ({ exe, mount } = await installApp(work, res));
+    if (!exe || !fs.existsSync(exe)) throw new Error('the app was not installed');
+    const port = 9333;
+    const home = freshHome();
+    log('launching the app with remote debugging');
+    child = spawn(exe, [`--remote-debugging-port=${port}`], { env: { ...(IS_WIN ? process.env : homeEnv(home)) }, cwd: home, stdio: 'ignore' });
+    let page = null;
+    for (let i = 0; i < 90 && !page; i++) {
+      await sleep(1000);
+      try { page = (await (await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000) })).json()).find(t => t.type === 'page' && /^https?:/.test(t.url)) || null; } catch (e) { /* not up yet */ }
+    }
+    if (!page) throw new Error('Perch Terminal did not open a page for DevTools');
+    cdp = await cdpConnect(page.webSocketDebuggerUrl);
+    for (const d of ['Page', 'Runtime', 'Network']) await cdp.send(`${d}.enable`);
+    cdp.on((m) => {
+      const p = m.params || {};
+      if (m.method === 'Runtime.exceptionThrown') errors.push(clip(p.exceptionDetails?.exception?.description || p.exceptionDetails?.text, 200));
+      else if (m.method === 'Runtime.consoleAPICalled' && p.type === 'error') errors.push(clip((p.args || []).map(a => a.value ?? a.description ?? '').join(' '), 200));
+      else if (m.method === 'Network.responseReceived' && p.response?.status >= 400 && /XHR|Fetch|Document/.test(p.type)) failed.push(`${p.response.status} ${clip(p.response.url, 120)}`);
+    });
+    await sleep(4000);
+    const observe = async (n, note = '') => {
+      const v = await cdp.send('Runtime.evaluate', { expression: SNAPSHOT_JS, returnByValue: true }).catch(() => null);
+      let snap = {};
+      try { snap = JSON.parse(v?.result?.value || '{}'); } catch (e) { /* page gone */ }
+      if (snap.url && APP_BLOCKED.test(snap.url)) {
+        await cdp.send('Page.navigate', { url: 'https://app.perchai.app/' }).catch(() => {});
+        note = `blocked: tests never open ${clip(snap.url, 80)}; went back`;
+      }
+      const shot = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 70 }).catch(() => null);
+      return { n, title: clip(snap.title, 100), url: clip(snap.url, 200), overlay: snap.overlay || '', text: snap.text || '', elements: (snap.elements || []).slice(0, 80), errors: errors.splice(0).slice(0, 5), failed: failed.splice(0).slice(0, 5), note, shot: shot?.data && n <= 40 ? { name: `app-${n}.jpg`, b64: shot.data } : null };
+    };
+    const key = crypto.randomBytes(32);
+    const pem = fs.readFileSync(path.join(HERE, 'bot-public.pem'), 'utf8');
+    const wrapped = crypto.publicEncrypt({ key: pem, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, key).toString('base64');
+    await mailPut(branch, 'hello.json', { v: 1, id, key: wrapped, box: boxed(key, { obs: await observe(0), version: res.version || '' }) });
+    log('session open, waiting for the bot');
+    let steps = 0;
+    for (let n = 1; n <= 40; n++) {
+      let cmd = null;
+      for (let w = 0; w < 160 && !cmd; w++) { // up to 4 minutes for the bot's next move
+        const msg = await mailGet(branch, `cmd-${n}.json`);
+        if (msg) { try { cmd = unboxed(key, msg); } catch (e) { throw new Error('a command that is not from the bot'); } }
+        else await sleep(1500);
+      }
+      if (!cmd || cmd.action === 'end') break;
+      steps += 1;
+      let note = '';
+      try {
+        if (cmd.action === 'click') { const c = await elementCenter(cdp, cmd.target); if (!c) note = `no element ${cmd.target}`; else await clickAt(cdp, c.x, c.y); }
+        else if (cmd.action === 'type') {
+          if (cmd.target) { const c = await elementCenter(cdp, cmd.target); if (c) await clickAt(cdp, c.x, c.y); else note = `no element ${cmd.target}`; }
+          if (!note) await cdp.send('Input.insertText', { text: String(cmd.text || '').slice(0, 500) });
+        } else if (cmd.action === 'key') await pressKey(cdp, cmd.key || 'Enter');
+        else if (cmd.action === 'scroll') await cdp.send('Runtime.evaluate', { expression: `window.scrollBy(0, ${/up/i.test(cmd.text || '') ? -600 : 600})` });
+        else if (cmd.action === 'wait') await sleep(Math.min(15000, Math.max(300, Number(cmd.ms) || 2000)));
+      } catch (e) { note = clip(e.message, 120); }
+      await sleep(1200);
+      await mailPut(branch, `obs-${n}.json`, boxed(key, { obs: await observe(n, note) }));
+    }
+    return { ok: true, steps, version: res.version || '' };
+  } catch (e) {
+    return { ok: false, error: clip(e.message, 200), version: res.version || '' };
+  } finally {
+    if (cdp) cdp.close();
+    if (child && child.exitCode == null) { try { child.kill('SIGKILL'); } catch (e) { /* gone */ } }
+    if (IS_WIN) await PS("Get-Process | Where-Object { $_.ProcessName -match 'Perch' } | Stop-Process -Force -ErrorAction SilentlyContinue");
+    if (mount) await run('hdiutil', ['detach', mount, '-force'], { ms: 60000 });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Encrypted result
 // ---------------------------------------------------------------------------
 
@@ -499,6 +681,7 @@ async function main() {
   try { if (job.cli) result.cli = await cliCheck(job.cli); } catch (e) { result.cli = { error: clip(e.message, 200) }; }
   try { if (job.tui && IS_WIN) result.tui = await tuiWindows(job.tui, shotsDir); } catch (e) { result.tui = { ok: false, error: clip(e.message, 200) }; }
   try { if (job.desktop) result.desktop = await desktopCheck(job.desktop, shotsDir); } catch (e) { result.desktop = { error: clip(e.message, 200) }; }
+  try { if (job.app?.session) result.app = await appSession(job.app, id); } catch (e) { result.app = { ok: false, error: clip(e.message, 200) }; }
   const files = fs.readdirSync(shotsDir).filter(n => /^[a-z0-9-]+\.png$/.test(n)).sort().slice(0, 10)
     .map(name => ({ name, b64: fs.readFileSync(path.join(shotsDir, name)).toString('base64') }));
   const pem = fs.readFileSync(path.join(HERE, 'bot-public.pem'), 'utf8');
