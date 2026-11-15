@@ -190,6 +190,42 @@ function Get-Win([int]$id) { $p = Get-Process -Id $id -ErrorAction SilentlyConti
 function Front($h) { [W]::ShowWindow($h, 9) | Out-Null; [W]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 300 }
 `;
 
+// Reads the text a console shows (its active screen buffer, the alternate one included) by attaching
+// to it, like any console program would. Screenshots of conhost miss full-screen TUIs.
+const READ_CONSOLE_CS = `
+using System; using System.IO; using System.Text; using System.Runtime.InteropServices;
+public static class CON {
+  [DllImport("kernel32.dll")] static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sec, uint d, uint f, IntPtr t);
+  [StructLayout(LayoutKind.Sequential)] public struct COORD { public short X, Y; }
+  [StructLayout(LayoutKind.Sequential)] public struct SR { public short Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct CSBI { public COORD Size; public COORD Cursor; public ushort Attr; public SR Win; public COORD Max; }
+  [DllImport("kernel32.dll")] static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CSBI i);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool ReadConsoleOutputCharacterW(IntPtr h, StringBuilder b, uint n, COORD c, out uint r);
+  public static void Dump(uint pid, string file) {
+    FreeConsole();
+    if (!AttachConsole(pid)) { File.WriteAllText(file, "ATTACH FAILED " + Marshal.GetLastWin32Error()); return; }
+    IntPtr h = CreateFileW("CONOUT$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+    CSBI i; if (!GetConsoleScreenBufferInfo(h, out i)) { FreeConsole(); File.WriteAllText(file, "INFO FAILED"); return; }
+    var sb = new StringBuilder();
+    for (short y = i.Win.Top; y <= i.Win.Bottom; y++) { var line = new StringBuilder(i.Size.X + 1); uint r; ReadConsoleOutputCharacterW(h, line, (uint)i.Size.X, new COORD { X = 0, Y = y }, out r); sb.AppendLine(line.ToString(0, (int)Math.Min(r, (uint)line.Length)).TrimEnd()); }
+    FreeConsole(); File.WriteAllText(file, sb.ToString(), Encoding.UTF8);
+  }
+}`;
+
+async function readConsole(conhostPid) {
+  const file = path.join(os.tmpdir(), `con-${conhostPid}-${Date.now()}.txt`);
+  await PS(`Add-Type -TypeDefinition @"
+${READ_CONSOLE_CS}
+"@
+$c = Get-CimInstance Win32_Process -Filter "ParentProcessId=${conhostPid}" | Where-Object { $_.Name -eq 'cmd.exe' } | Select-Object -First 1
+if ($c) { [CON]::Dump([uint32]$c.ProcessId, '${psq(file)}') } else { Set-Content -Path '${psq(file)}' -Value 'NO CONSOLE PROCESS' }`, 45000);
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); fs.rmSync(file, { force: true }); } catch (e) { /* none */ }
+  return text.split('\n').map(l => l.replace(/\s+$/, '')).join('\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, 5000);
+}
+
 async function tuiWindows(spec, outDir) {
   const version = String(spec.version || 'latest');
   if (!/^(latest|\d+\.\d+\.\d+(-[\w.]+)?)$/.test(version)) throw new Error('bad version');
@@ -224,7 +260,7 @@ for ($k = 0; $k -lt 5; $k++) {
   Start-Sleep -Milliseconds 450
 }
 $best.Save('${psq(file)}', [System.Drawing.Imaging.ImageFormat]::Png)`, 60000);
-    frames.push({ label: clip(label, 80), shot: fs.existsSync(file) ? path.basename(file) : null });
+    frames.push({ label: clip(label, 80), shot: fs.existsSync(file) ? path.basename(file) : null, screen: await readConsole(pid) });
   };
   try {
     await capture('start');
