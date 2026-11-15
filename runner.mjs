@@ -234,7 +234,7 @@ $cw = ($c.Right - $c.Left) / ${curCols}; $ch = ($c.Bottom - $c.Top) / ${curRows}
       else continue;
       if (keys != null) await PS(`${WIN_API}
 $h = Get-Win ${pid}; if ($h -ne [IntPtr]::Zero) { Front $h }; [System.Windows.Forms.SendKeys]::SendWait('${psq(keys)}')`, 30000);
-      await sleep(Math.min(8000, Math.max(400, Number(st.settleMs) || 1200)));
+      await sleep(Math.min(8000, Math.max(400, Number(st.settleMs) || 1800)));
       await capture(label);
     }
     return { ok: true, version: g.version === 'latest' ? null : g.version, size: `${cols}x${rows}`, console: 'conhost', frames };
