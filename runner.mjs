@@ -183,6 +183,13 @@ public static class W {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool r);
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder b, int n);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  // A visible top-level window whose title contains the text (Windows Terminal hosts many windows in one process).
+  public static long Find(string part) { long found = 0; EnumWindows((h, l) => { var b = new System.Text.StringBuilder(512); GetWindowTextW(h, b, 512);
+    if (IsWindowVisible(h) && b.ToString().Contains(part)) { found = (long)h; return false; } return true; }, IntPtr.Zero); return found; }
 }
 "@
 function Get-Win([int]$id) { $p = Get-Process -Id $id -ErrorAction SilentlyContinue; if ($p -and $p.MainWindowHandle -ne 0) { return $p.MainWindowHandle }
@@ -246,12 +253,11 @@ async function tuiWindows(spec, outDir) {
   let cmdPid = 0, hwnd = 0;
   for (let i = 0; i < 20 && !(cmdPid && hwnd); i++) {
     await sleep(1000);
-    const found = await PS(`$c = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" | Where-Object { $_.CommandLine -match '${marker}' } | Select-Object -First 1
-$w = Get-Process | Where-Object { $_.MainWindowTitle -match '${marker}' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-if (-not $w) { $w = Get-Process ${terminal === 'wt' ? 'WindowsTerminal' : 'conhost'} -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object StartTime -Descending | Select-Object -First 1 }
-"$($c.ProcessId) $([int64]$w.MainWindowHandle)"`, 30000);
-    const [a, b] = found.out.trim().split(/\s+/).map(Number);
-    cmdPid = a || cmdPid; hwnd = b || hwnd;
+    const found = await PS(`${WIN_API}
+$c = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '${marker}' } | Select-Object -First 1
+"IDS:$($c.ProcessId):$([W]::Find('${marker}'))"`, 30000);
+    const m = found.out.match(/IDS:(\d*):(\d*)/);
+    if (m) { cmdPid = Number(m[1]) || cmdPid; hwnd = Number(m[2]) || hwnd; }
   }
   if (!cmdPid || !hwnd) return { ok: false, error: `the ${terminal === 'wt' ? 'Windows Terminal' : 'console'} window did not open` };
   await sleep(Math.min(20000, Math.max(4000, Number(spec.startMs) || 8000)));
@@ -303,7 +309,9 @@ $h = [IntPtr]${hwnd}; if ($h -ne [IntPtr]::Zero) { Front $h }; [System.Windows.F
     }
     return { ok: true, version: g.version === 'latest' ? null : g.version, size: `${cols}x${rows}`, console: terminal === 'wt' ? 'Windows Terminal' : 'conhost', frames };
   } finally {
-    await PS(`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'perchai-cli' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Stop-Process -Id ${cmdPid} -Force -ErrorAction SilentlyContinue; Get-Process ${terminal === 'wt' ? 'WindowsTerminal' : 'conhost'} -ErrorAction SilentlyContinue | Where-Object { [int64]$_.MainWindowHandle -eq ${hwnd} } | Stop-Process -Force -ErrorAction SilentlyContinue`);
+    // Only perch and its cmd: the window closes by itself. Never stop a terminal process, since
+    // Windows Terminal is one process for every window, the runner's own console included.
+    await PS(`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object { $_.CommandLine -match 'perchai-cli' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Stop-Process -Id ${cmdPid} -Force -ErrorAction SilentlyContinue`);
   }
 }
 
