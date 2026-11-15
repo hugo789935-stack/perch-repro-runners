@@ -245,7 +245,11 @@ async function tuiWindows(spec, outDir) {
   // Windows 10's default); perch runs in an empty folder at the asked size.
   const hasWt = (await PS('if (Get-Command wt.exe -ErrorAction SilentlyContinue) { "yes" }')).out.includes('yes');
   const terminal = spec.terminal === 'conhost' || !hasWt ? 'conhost' : 'wt';
-  const inner = `title ${marker} & cd /d ${work} & perch`; // the temp path has no spaces
+  // GitHub sets CI=true and GITHUB_ACTIONS; CLI renderers (Ink and friends) then skip the live
+  // screen and only print final output, so perch runs without them, like on a user's machine.
+  const unsetCi = ['CI', 'CONTINUOUS_INTEGRATION', 'BUILD_NUMBER', 'BUILD_ID', 'RUN_ID', 'GITHUB_ACTIONS', 'TF_BUILD', 'RUNNER_TEMP']
+    .map(v => `set ${v}=`).join('& ');
+  const inner = `${unsetCi}& title ${marker} & cd /d ${work} & perch`; // the temp path has no spaces
   await PS(terminal === 'wt'
     ? `Start-Process wt.exe -ArgumentList '-w new --size ${cols},${rows} --title ${marker} --suppressApplicationTitle cmd.exe /k "${psq(inner)}"'`
     : `Start-Process conhost.exe -ArgumentList 'cmd.exe /k mode con: cols=${cols} lines=${rows} & ${psq(inner)}'`, 30000);
@@ -259,7 +263,11 @@ $c = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction Silentl
     const m = found.out.match(/IDS:(\d*):(\d*)/);
     if (m) { cmdPid = Number(m[1]) || cmdPid; hwnd = Number(m[2]) || hwnd; }
   }
-  if (!cmdPid || !hwnd) return { ok: false, error: `the ${terminal === 'wt' ? 'Windows Terminal' : 'console'} window did not open` };
+  if (!cmdPid || !hwnd) {
+    const seen = await PS(`${WIN_API}
+Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { "$($_.ProcessName): $($_.MainWindowTitle)" } | Select-Object -First 8`, 30000);
+    return { ok: false, error: `the ${terminal === 'wt' ? 'Windows Terminal' : 'console'} window did not open (cmd ${cmdPid ? 'found' : 'not found'}, window ${hwnd ? 'found' : 'not found'}; windows: ${clip(seen.out.replace(/\s*\n\s*/g, ' | '), 300)})` };
+  }
   await sleep(Math.min(20000, Math.max(4000, Number(spec.startMs) || 8000)));
   const frames = [];
   let shotN = 0, curCols = cols, curRows = rows;
